@@ -1,0 +1,13 @@
+---
+app_root_path: "/opt/app"
+app_main: "app:app"
+app_service_name: "mds_example_webapp"
+app_num_workers: 4
+app_socket: "127.0.0.1:5001"
+
+app_run_as_user: "example_user"
+
+requirements_path: "{{ app_root_path }}/requirements.txt"
+app_virtualenv_path: "{{ app_root_path }}/virtualenv"
+app_virtualenv_bin_path: "{{ app_virtualenv_path }}/bin"
+

@@ -1,0 +1,193 @@
+---
+
+stages:
+  - Build the images
+  - Run tests (sunny day)
+  - Run tests (failover)
+
+default:
+  before_script:
+    - vagrant box update
+    - source ~/ci/bin/activate
+    - vagrant up
+    - export VM_PORT=$(vagrant port --machine-readable  | awk -F, '$4==80{print $5}')
+    - echo $DOCKER_CONFIG_JSON > config.json
+    - vagrant upload config.json /home/vagrant/.docker/config.json
+    - |-
+      cat -- <<EOF > conftest.py
+      import pytest
+      import random
+      import uuid
+
+
+      @pytest.fixture
+      def rand_ints():
+          n=20
+          rn = [random.randint(0, 100) for _ in range(n)]
+          rn.pop()
+          rn.append(rn[0])
+          return rn
+
+
+      def avg(numbers):
+          return sum(numbers) / len(numbers)
+
+
+      def format_examples(ints):
+          return [f"{uuid.uuid4()} {x}" for x in ints]
+
+
+      @pytest.fixture()
+      def random_examples(rand_ints):
+          return avg(rand_ints), format_examples(rand_ints)
+
+
+      @pytest.fixture()
+      def random_examples_two_batches(rand_ints):
+          n = len(rand_ints) // 2
+          batch1 = rand_ints[:n]
+          batch2 = rand_ints[n:]
+          return (
+              (avg(batch1), format_examples(batch1)),
+              (avg(batch2), format_examples(batch2)),
+          )
+
+
+      @pytest.fixture()
+      def host():
+          return f"http://localhost:$VM_PORT"
+
+
+      @pytest.fixture()
+      def submit_url(host):
+          return f"{host}/submit"
+
+
+      @pytest.fixture()
+      def avg_url(host):
+          return f"{host}/avg"
+
+
+      def compare(expected, actual_response):
+          assert abs(expected - actual_response) < 1e-10, \
+                 f"/avg returned wrong value: {actual_response}, expected: {expected}"
+      EOF
+
+  after_script:
+    - if [ ! $DEGUG_MODE ]; then vagrant destroy --force; git clean -fxd; fi
+
+
+build:
+  stage: Build the images
+  only:
+    - merge_requests
+  tags:
+    - baremetal
+  script:
+    - vagrant ssh -c 'cd /vagrant && docker-compose build && docker-compose push'
+    # making sure build is not trivial
+    - vagrant ssh -c 'cd /vagrant && docker-compose build web && (docker rmi $(docker images -a -q) || true) && docker-compose pull web && docker-compose up --no-build -d web'
+
+
+test:
+  stage: Run tests (sunny day)
+  only:
+    - merge_requests
+  allow_failure: true
+  tags:
+    - baremetal
+  script:
+    - vagrant ssh -c 'cd /vagrant && docker-compose pull && docker-compose up --no-build -d'
+    - |-
+      cat -- <<EOF > test_service.py
+      import os
+      import requests
+      import random
+      import time
+
+      from conftest import compare
+
+
+      def test_its_up(avg_url):
+
+          avg_probe_result = requests.get(avg_url)
+          assert avg_probe_result.status_code == 200, \
+                 f"GET {avg_url} returned {avg_probe_result.status_code} with text {avg_probe_result.text}"
+
+
+      def test_submit_works(random_examples, submit_url, avg_url):
+
+          expected_avg, examples = random_examples
+
+          for ex in examples:
+              submit_result = requests.post(submit_url, ex)
+              assert submit_result.status_code == 201, \
+                    f"POST {submit_url} returned {submit_result.status_code} with text {submit_result.text}"
+
+          avg_probe_result = requests.get(avg_url)
+          assert avg_probe_result.status_code == 200, \
+                 f"GET {avg_url} with {examples} returned {avg_probe_result.status_code} with text {avg_probe_result.text}"
+
+          response_avg = float(avg_probe_result.text)
+          compare(expected_avg, response_avg)
+      EOF
+    - echo "Wating for some time for the application to become available"
+    - for i in {1..60}; do if curl --fail --silent localhost:$VM_PORT >/dev/null; then break; else sleep 1; fi; done;
+    - py.test -v test_service.py
+
+
+test_failover:
+  stage: Run tests (failover)
+  only:
+    - merge_requests
+  allow_failure: true
+  tags:
+    - baremetal
+  script:
+    - vagrant ssh -c 'cd /vagrant && docker-compose pull && docker-compose up --no-build -d'
+    - |-
+      cat -- <<EOF > test_failover.py
+      import requests
+      import subprocess
+
+      from conftest import compare
+
+
+      def test_failover(random_examples_two_batches, submit_url, avg_url):
+          batch1, batch2 = random_examples_two_batches
+          avg1, examples1 = batch1
+          avg2, examples2 = batch2
+
+          for ex in examples1:
+              requests.post(submit_url, ex).raise_for_status()
+
+          live_avg_request = requests.get(avg_url)
+          live_avg_request.raise_for_status()
+
+          # We're memorizing /avg value here for the first batch of examples.
+          # It's supposed to be later served by the fallback service when our main web service is down
+          last_avg = float(live_avg_request.text)
+
+          # This second batch should not affect the value that's returned by the fallback
+          # (fallback must just cache the last returned value)
+          for ex in examples2:
+              requests.post(submit_url, ex).raise_for_status()
+
+          # Bringing the web service down
+          subprocess.check_call("vagrant ssh -c 'cd /vagrant && docker-compose kill web'", shell=True)
+
+          # Expecting fallback web service to step in
+          supposedly_cached_result = requests.get(avg_url)
+          compare(last_avg, float(supposedly_cached_result.text))
+
+          # Expecting fallback service to not accept any new submissions
+          assert requests.post(submit_url, ex).status_code == 503
+
+          # restart the webservice
+          subprocess.check_call("vagrant ssh -c 'cd /vagrant && docker-compose restart'", shell=True)
+
+      EOF
+
+    - echo "Wating for some time for the application to become available"
+    - for i in {1..60}; do if curl --fail --silent localhost:$VM_PORT >/dev/null; then break; else sleep 1; fi; done;
+    - py.test -v test_failover.py

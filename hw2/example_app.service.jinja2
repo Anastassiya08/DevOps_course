@@ -1,0 +1,21 @@
+[Unit]
+Description=MDS Webapp
+After=network.target
+
+[Service]
+Environment="PATH={{ app_virtualenv_bin_path }}"
+Environment="words={{ hello_pages }}"
+Environment="n={{ hello_pages|count }}"
+
+{% for i in range(hello_pages|count) %}
+Environment="w{{ i }}={{ hello_pages[i] }}"
+{% endfor %}
+
+WorkingDirectory={{ app_root_path }}
+ExecStart={{ app_virtualenv_bin_path }}/gunicorn --workers {{ app_num_workers }} --bind {{ app_socket }} {{ app_main }}
+User={{ app_run_as_user }}
+Group={{ app_run_as_user }}
+
+[Install]
+WantedBy=multi-user.target
+
